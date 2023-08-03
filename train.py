@@ -47,6 +47,8 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 data_dir = os.path.join('data', dataset)
+train_file = os.path.join(data_dir, 'train.bin')
+val_file = os.path.join(data_dir, 'val.bin')
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024 # context length
@@ -123,8 +125,8 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+train_data = np.memmap(train_file, dtype=np.uint16, mode='r')
+val_data = np.memmap(val_file, dtype=np.uint16, mode='r')
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -251,6 +253,7 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
+    wandb.login() # use API key from WANDB_API_KEY env variable
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
@@ -267,14 +270,17 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if (iter_num % eval_interval == 0  or iter_num == max_iters) and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train ppl {math.exp(losses['train']):.1f}, val ppl {math.exp(losses['val']):.1f} total val loss {losses['val']*len(val_data):.1f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/ppl": math.exp(losses['train']),
+                "val/ppl": math.exp(losses['val']),
+                "val/total_loss": losses['val']*len(val_data),
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
@@ -324,14 +330,14 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    if (iter_num % log_interval == 0 or iter_num == max_iters) and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, itr time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% ETA {dt*(max_iters-iter_num)/3600:.1f}h")
     iter_num += 1
     local_iter_num += 1
 
