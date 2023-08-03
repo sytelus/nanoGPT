@@ -1,1 +1,1 @@
-torchrun --standalone --nproc_per_node=1 train.py config/train_gpt2_wikitext103
+torchrun --standalone --nproc_per_node=1 train.py config/train_gpt2_wikitext103.py

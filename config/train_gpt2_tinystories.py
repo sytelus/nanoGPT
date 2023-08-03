@@ -17,10 +17,10 @@ val_file = os.path.join(data_dir, 'validation.bin')
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+batch_size = 12*5
 learning_rate = 6e-4
 block_size = 1024
-gradient_accumulation_steps = 8*5
+gradient_accumulation_steps = 8
 
 max_iters = 40000
 lr_decay_iters = 40000
