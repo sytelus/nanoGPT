@@ -347,3 +347,5 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+print("training completed.")
