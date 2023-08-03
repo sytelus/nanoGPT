@@ -1,8 +1,10 @@
 # saves the openwebtext dataset to a binary file for training. following was helpful:
 # https://github.com/HazyResearch/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
 
+import math
 import os
 from tqdm import tqdm
+from multiprocessing import cpu_count, Pool
 import numpy as np
 import tiktoken
 import datasets
@@ -10,14 +12,6 @@ from datasets import load_dataset # huggingface datasets
 
 from functools import partial
 
-# number of workers in .map() call
-# good number to use is ~order number of cpu cores // 2
-num_proc = 8
-
-# number of workers in load_dataset() call
-# best number might be different from num_proc above as it also depends on NW speed.
-# it is better than 1 usually though
-num_proc_load_dataset = num_proc
 
 if __name__ == '__main__':
     data_root = os.environ.get('DATA_ROOT', os.path.dirname(__file__))
@@ -27,8 +21,18 @@ if __name__ == '__main__':
     dataset = load_dataset("wikitext", name=dataset_name)
     print(f'loaded dataset {dataset_name}, {len(dataset["train"])} rows')
 
+    class TikTokenFactory:
+        def __init__(self):
+            self._enc = None
+            self.eot_token = None
+
+        def encode_ordinary(self, text):
+            if self._enc is None:
+                self._enc = tiktoken.get_encoding("gpt2")
+                self.eot_token = self._enc.eot_token
+            return self._enc.encode_ordinary(text)
+
     # we now want to tokenize the dataset. first define the encoding function (gpt2 bpe)
-    enc = tiktoken.get_encoding("gpt2")
     def process(enc, example):
         ids = enc.encode_ordinary(example['text']) # encode_ordinary ignores any special tokens
         ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
@@ -36,13 +40,19 @@ if __name__ == '__main__':
         out = {'ids': ids, 'len': len(ids)}
         return out
 
-    process_enc = partial(process, enc)
+    # tokenized = {}
+    # for split_name, ds in dataset.items():
+    #     process_count = max(1, min(cpu_count() - 1, len(ds) // 10))
+    #     with Pool(process_count) as pool:
+    #         it = pool.imap(partial(process, TikTokenFactory()), ds, chunksize=len(ds) // process_count)
+    #         tokenized[split_name] = list(tqdm(it, desc=f'processing {split_name} on {process_count} CPUs', total=len(ds)))
+
     # tokenize the dataset
     tokenized = dataset.map(
-        process_enc,
+        partial(process, TikTokenFactory()),
         remove_columns=['text'],
         desc="tokenizing the splits",
-        num_proc=num_proc,
+        num_proc=max(1, cpu_count()//2),
     )
 
     tokenized_path = os.path.join(data_root,'tokenized', dataset_name, 'tiktoken')
@@ -54,7 +64,7 @@ if __name__ == '__main__':
         filename = os.path.join(tokenized_path, f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
+        total_batches = 2**math.ceil(math.log2((len(dset) // 8192) + 1))
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
