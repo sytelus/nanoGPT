@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+import sys
 import random
 import time
 import math
@@ -81,6 +82,15 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+# We setup env variable if debugging mode is detected for vs_code_debugging.
+# The reason for this is that when Python multiprocessing is used, the new process
+# spawned do not inherit 'pydevd' so those process do not get detected as in debugging mode
+# even though they are. So we set env var which does get inherited by sub processes.
+if 'pydevd' in sys.modules:
+    os.environ['vs_code_debugging'] = 'True'
+def is_debugging()->bool:
+    return 'vs_code_debugging' in os.environ and os.environ['vs_code_debugging']=='True'
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -253,8 +263,20 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.login() # use API key from WANDB_API_KEY env variable
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    if not is_debugging():
+        wandb.login() # use API key from WANDB_API_KEY env variable
+
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config,
+               save_code=True, magic=True, mode='disabled' if is_debugging() else 'online')
+    # x-axis metric
+    wandb.define_metric("train/step")
+    # plot all metrics against train step
+    wandb.define_metric("train/loss", step_metric="train/step", summary="min", goal="min")
+    wandb.define_metric("val/loss", step_metric="train/step", summary="min", goal="min")
+    wandb.define_metric("train/ppl", step_metric="train/step", summary="min", goal="min")
+    wandb.define_metric("val/ppl", step_metric="train/step", summary="min", goal="min")
+    wandb.define_metric("mfu", step_metric="train/step", summary="mean", goal="max")
+
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -275,8 +297,8 @@ while True:
         print(f"step {iter_num}: train ppl {math.exp(losses['train']):.1f}, val ppl {math.exp(losses['val']):.1f} total val loss {losses['val']*len(val_data):.1f}")
         if wandb_log:
             wandb.log({
-                "iter": iter_num,
                 "train/loss": losses['train'],
+                "train/step": iter_num,
                 "val/loss": losses['val'],
                 "train/ppl": math.exp(losses['train']),
                 "val/ppl": math.exp(losses['val']),
@@ -284,6 +306,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        # checkpoint
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
