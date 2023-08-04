@@ -112,7 +112,7 @@ else:
     ddp_rank, ddp_local_rank = 0, 0
 
 
-logger = Logger(wandb_log, master_process)
+logger = Logger(wandb_log, master_process, wandb_project, wandb_run_name, config)
 
 logger.summary({"global_batch_size": gradient_accumulation_steps * batch_size * ddp_world_size})
 logger.summary({"local_batch_size": gradient_accumulation_steps * batch_size})

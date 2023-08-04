@@ -1,8 +1,9 @@
 
 from typing import Any, Mapping, Optional, Union
 import logging
-from utils import full_path, is_debugging
+from nanogpt_common.utils import full_path, is_debugging
 import psutil
+import os
 
 import wandb
 import torch
@@ -40,11 +41,11 @@ def create_py_logger(filepath:Optional[str]=None,
     return logger
 
 
-def create_wandb_logger():
+def create_wandb_logger(wandb_project, wandb_run_name, config):
     wandb.login() # use API key from WANDB_API_KEY env variable
 
     run = wandb.init(project=wandb_project, name=wandb_run_name, config=config,
-            save_code=True, magic=True)
+                     save_code=True)
     # x-axis metric
     wandb.define_metric("train/step")
     # plot all metrics against train step
@@ -56,12 +57,15 @@ def create_wandb_logger():
     return run
 
 def _fmt(val:Any)->str:
+    if isinstance(val, torch.Tensor):
+        if val.numel() == 1:
+            val = val.item()
     if isinstance(val, float):
         return f'{val:.4g}'
     return str(val)
 
 class Logger:
-    def __init__(self, enable_wandb:bool, master_process:bool) -> None:
+    def __init__(self, enable_wandb:bool, master_process:bool, wandb_project:str, wandb_run_name:str, config:dict) -> None:
         self._logger = None
         self._run = None
         self.enable_wandb = enable_wandb
@@ -70,7 +74,7 @@ class Logger:
         if master_process:
             self._logger = create_py_logger()
         if enable_wandb and master_process:
-            self._run = create_wandb_logger()
+            self._run = create_wandb_logger(wandb_project, wandb_run_name, config)
         # else leave things to None
 
     def info(self, d:Union[str, Mapping[str,Any]], py_logger_only:bool=False):
@@ -90,7 +94,7 @@ class Logger:
 
     def summary(self, d:Mapping[str,Any], py_logger_only:bool=False):
         if self._logger is not None:
-            self._logger.info(d)
+            self.info(d, py_logger_only=True)
 
         if not py_logger_only and self.enable_wandb and self._run is not None:
             for k, v in d.items():
@@ -98,13 +102,14 @@ class Logger:
         # else do nothing
 
     def log_sys_info(self):
-        self.summary({'torch.distributed.is_available': torch.distributed.dist.is_available(),
-                        'gloo_available': torch.distributed.dist.is_gloo_available(),
-                        'mpi_available': torch.distributed.dist.is_mpi_available(),
-                        'nccl_available': torch.distributed.dist.is_nccl_available(),
-                        'get_world_size': torch.distributed.dist.get_world_size(),
-                        'get_rank': torch.distributed.dist.get_rank(),
-                        'is_anomaly_enabled': torch.distributed.dist.is_anomaly_enabled(),
+        self.summary({  'torch.distributed.is_initialized': torch.distributed.is_initialized(),
+                        'torch.distributed.is_available': torch.distributed.is_available(),
+                        'gloo_available': torch.distributed.is_gloo_available(),
+                        'mpi_available': torch.distributed.is_mpi_available(),
+                        'nccl_available': torch.distributed.is_nccl_available(),
+                        'get_world_size': torch.distributed.get_world_size() if torch.distributed.is_initialized() else None,
+                        'get_rank': torch.distributed.get_rank() if torch.distributed.is_initialized() else None,
+                        'is_anomaly_enabled': torch.is_anomaly_enabled(),
                         'device_count': torch.cuda.device_count(),
 
                         'cudnn.enabled': torch.backends.cudnn.enabled,
