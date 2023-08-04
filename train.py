@@ -23,6 +23,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import psutil
 
 import numpy as np
 import torch
@@ -30,10 +31,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from nanogpt_common import utils
+from nanogpt_common.logger import Logger
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+seed = 1337
 out_dir = 'out'
 eval_interval = 2000 # how many training iterations between evals
 log_interval = 1
@@ -50,6 +54,7 @@ dataset = 'openwebtext'
 data_dir = os.path.join('data', dataset)
 train_file = os.path.join(data_dir, 'train.bin')
 val_file = os.path.join(data_dir, 'val.bin')
+test_file = None
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024 # context length
@@ -83,14 +88,6 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-# We setup env variable if debugging mode is detected for vs_code_debugging.
-# The reason for this is that when Python multiprocessing is used, the new process
-# spawned do not inherit 'pydevd' so those process do not get detected as in debugging mode
-# even though they are. So we set env var which does get inherited by sub processes.
-if 'pydevd' in sys.modules:
-    os.environ['vs_code_debugging'] = 'True'
-def is_debugging()->bool:
-    return 'vs_code_debugging' in os.environ and os.environ['vs_code_debugging']=='True'
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -112,22 +109,27 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    ddp_rank, ddp_local_rank = 0, 0
+
+
+logger = Logger(wandb_log, master_process)
+
+logger.summary({"global_batch_size": gradient_accumulation_steps * batch_size * ddp_world_size})
+logger.summary({"local_batch_size": gradient_accumulation_steps * batch_size})
+logger.summary({"tokens_per_iter": gradient_accumulation_steps * batch_size * ddp_world_size * block_size})
+
+logger.summary({'ddp_world_size': ddp_world_size,
+                'ddp_rank': ddp_rank,
+                'ddp_local_rank': ddp_local_rank,
+                'device': device,})
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    logger.summary({"out_dir": out_dir})
 
-# setup torch and seeds
-torch.backends.cudnn.enabled = True
-seed = 1337 + seed_offset
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
-torch.set_printoptions(precision=10)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+utils.setup_torch()
+utils.setup_seed(seed + seed_offset)
+logger.log_sys_info()
 
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
@@ -137,6 +139,12 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 train_data = np.memmap(train_file, dtype=np.uint16, mode='r')
 val_data = np.memmap(val_file, dtype=np.uint16, mode='r')
+test_data = None if test_file is None else np.memmap(test_file, dtype=np.uint16, mode='r')
+
+logger.summary({'train_len': len(train_data),
+                'val_len': len(val_data),
+                'test_len': len(test_data) if test_data is not None else 0})
+
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -160,20 +168,23 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    logger.info(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    logger.info("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        logger.info("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+
+    logger.summary(model_args)
+
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -222,7 +233,7 @@ checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
+    logger.info("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
@@ -232,10 +243,10 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(splits=['train', 'val']):
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in splits:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -260,22 +271,6 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    if not is_debugging():
-        wandb.login() # use API key from WANDB_API_KEY env variable
-
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config,
-               save_code=True, magic=True, mode='disabled' if is_debugging() else 'online')
-    # x-axis metric
-    wandb.define_metric("train/step")
-    # plot all metrics against train step
-    wandb.define_metric("train/loss", step_metric="train/step", summary="min", goal="min")
-    wandb.define_metric("val/loss", step_metric="train/step", summary="min", goal="min")
-    wandb.define_metric("train/ppl", step_metric="train/step", summary="min", goal="min")
-    wandb.define_metric("val/ppl", step_metric="train/step", summary="min", goal="min")
-    wandb.define_metric("mfu", step_metric="train/step", summary="mean", goal="max")
 
 
 # training loop
@@ -294,18 +289,17 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if (iter_num % eval_interval == 0  or iter_num == max_iters) and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train ppl {math.exp(losses['train']):.1f}, val ppl {math.exp(losses['val']):.1f} total val loss {losses['val']*len(val_data):.1f}")
-        if wandb_log:
-            wandb.log({
-                "train/loss": losses['train'],
-                "train/step": iter_num,
-                "val/loss": losses['val'],
-                "train/ppl": math.exp(losses['train']),
-                "val/ppl": math.exp(losses['val']),
-                "val/total_loss": losses['val']*len(val_data),
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+        logger.info({"step":iter_num, "train_ppl": math.exp(losses['train']), "val_ppl": math.exp(losses['val']), "total_val_loss": losses['val']*len(val_data)}, py_logger_only=True)
+        logger.info({
+            "train/loss": losses['train'],
+            "train/step": iter_num,
+            "val/loss": losses['val'],
+            "train/ppl": math.exp(losses['train']),
+            "val/ppl": math.exp(losses['val']),
+            "val/total_loss": losses['val']*len(val_data),
+            "lr": lr,
+            "mfu": running_mfu*100, # convert to percentage
+        })
         # checkpoint
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -360,7 +354,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, itr time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% ETA {dt*(max_iters-iter_num)/3600:.1f}h")
+        logger.info({"iter": iter_num, "loss": lossf, "itr_time_ms": dt*1000, "mfu_a100": running_mfu*100, "ETA_hr":dt*(max_iters-iter_num)/3600})
     iter_num += 1
     local_iter_num += 1
 
@@ -368,7 +362,12 @@ while True:
     if iter_num > max_iters:
         break
 
+if test_data is not None:
+    losses = estimate_loss(splits=['test'])
+    logger.summary({"test_ppl": math.exp(losses['test']), "test_loss":losses['test'], "total_test_loss": losses['test']*len(test_data)})
+
 if ddp:
     destroy_process_group()
 
-print("training completed.")
+logger.info("training completed.")
+logger.finish()

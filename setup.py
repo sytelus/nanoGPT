@@ -16,12 +16,13 @@ install_requires=[
 
 setuptools.setup(
     name="nanoGPT",
-    version="1.0.0",
+    version="1.0.1",
     author="Andrej Karpathy",
     description="The simplest, fastest repository for training/finetuning medium-sized GPTs",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/karpathy/nanoGPT",
+    packages=setuptools.find_packages(include=['nanogpt_common']),
 	license='MIT',
     classifiers=[
         'Programming Language :: Python :: 3',

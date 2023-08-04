@@ -13,18 +13,26 @@ dataset = 'wikitext-103-raw-v1'
 data_dir = os.path.join(os.environ.get('DATA_ROOT', '/data'), 'tokenized', dataset, 'tiktoken')
 train_file = os.path.join(data_dir, 'train.bin')
 val_file = os.path.join(data_dir, 'validation.bin')
+test_file = os.path.join(data_dir, 'test.bin')
 
+# model
+# 355M params https://arxiv.org/pdf/1909.08053.pdf
+n_layer = 24
+n_head = 16
+n_embd = 1024
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+batch_size = 16
 learning_rate = 6e-4
 block_size = 1024
-gradient_accumulation_steps = 8*5
+gradient_accumulation_steps = 4 * 8
 
-max_iters = 40000
-lr_decay_iters = 40000
-warmup_iters = 1000
+learning_rate = 1.5e-4
+min_lr = 1e-5
+max_iters = 300000
+lr_decay_iters = 300000
+warmup_iters = 3000
 
 # eval stuff
 eval_interval = 1000
