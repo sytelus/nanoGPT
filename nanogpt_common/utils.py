@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+import psutil
 
 import numpy as np
 
@@ -20,6 +21,7 @@ def setup_torch():
     torch.set_printoptions(precision=10)
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+    os.environ['NUMEXPR_MAX_THREADS'] = str(psutil.cpu_count(logical=False) // 2)
 
 def setup_seed(seed):
     torch.manual_seed(seed)

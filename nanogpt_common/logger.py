@@ -120,7 +120,7 @@ class Logger:
                         'CUDA_VISIBLE_DEVICES': os.environ['CUDA_VISIBLE_DEVICES']
                                 if 'CUDA_VISIBLE_DEVICES' in os.environ else 'NotSet',
 
-                        'memory': psutil.virtual_memory(),
+                        'memory_gb': psutil.virtual_memory().available / (1024.0 ** 3),
                         'cpu_count': psutil.cpu_count(),
                         })
 
