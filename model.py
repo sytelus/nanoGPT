@@ -39,6 +39,9 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        # we need to generate the query, key, value from same input.
+        # we do this by projecting input to 3 times the sizse of embedding and then
+        # later spliiting it into 3 tensors in forward method
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -54,6 +57,8 @@ class CausalSelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
+            # below creates matrix of shape (1,1,T,T) where upper right triangle is 1 and rest is 0. The 0s will be replaced by -inf so that softmax will ignore them.
+            # buffers are not included in parameters() and therefore not trained
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
@@ -61,7 +66,10 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # self.c_attn(x) -> (B, T, 3 * n_embd)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # fist use view function to reshape (B,T,n_embed) to (B, T, n_head, n_embd // n_head)
+        # then transpose to finally get (B, n_head, T, n_embd // n_head)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -72,14 +80,27 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # @ = matrix multiplication, last two dimentions needs to be compatible
+            # q: (B, nh, T, dk)
+            # k: (B, nh, T, dk)
+            # k.transpose(-2, -1): (B, nh, dk, T)
+            # att: (B, nh, T, T)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+            # self.bias[:,:,:T,:T]: (B, nh, T, T)
+            # att: (B, nh, T, T)
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+
+            # att: (B, nh, T, T)
             att = F.softmax(att, dim=-1)
+            # att: (B, nh, T, T)
             att = self.attn_dropout(att)
+
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        # y->[b,t,c]
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -87,6 +108,11 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # inner layer is 4X larger, GELU applies after 1st layer, dropout at o/p
+        # this is regular MLP where non-linearity is applied all except output layer
+        # the reason it is not applied at o/p is because it is regression MLP as
+        # opposed to classification MLP. However, dropout is typically applied
+        # at inner layer and not the o/p. Experiment needed!
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
@@ -131,12 +157,13 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # token embedding
+            wpe = nn.Embedding(config.block_size, config.n_embd), # positional embedding
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        # bias is False because weights are tied
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -176,20 +203,23 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size() # batch size and length of sequence
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t) filled with 0..t-1 long ints
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
+
+        # final layer norm after all blocks because we don't use bias in last layer
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # linear transform from n_embed to vocab_size (don't use bias)
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
@@ -197,12 +227,18 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss # logits->[batch_size, seq_len, vocab_size], loss->[1]
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
+
+        # there are two places where block size appears. Note that if there was a
+        # better positional encoding then may be block_size wouldn't be issue here.
+        # the bias attribute is just buffer to create triangular attention mask
+        # and therefore not consequencial
+
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
@@ -352,8 +388,9 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            logits, _ = self(idx_cond) #logits->[batch_size, seq_len, vocab_size]
+
+            # pluck the logits at the final token and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:

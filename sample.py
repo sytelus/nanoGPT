@@ -78,6 +78,7 @@ if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
 start_ids = encode(start)
+# [None, ...] adds a batch dimension, i.e., turns shape from [n] into [1, n]
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
