@@ -7,9 +7,9 @@ wandb_log = True
 wandb_project = 'wikitext-2-raw-v1'
 wandb_run_name=None
 
-out_dir = os.path.join(os.environ.get('DATA_ROOT', 'out'), 'gpt2-124M-wikitext103')
+out_dir = os.path.join(os.environ.get('DATA_ROOT', 'out'), 'gpt2-wt2')
 
-dataset = 'wikitext-103-raw-v1'
+dataset = wandb_project
 data_dir = os.path.join(os.environ.get('DATA_ROOT', '/data'), 'tokenized', dataset, 'tiktoken')
 train_file = os.path.join(data_dir, 'train.bin')
 val_file = os.path.join(data_dir, 'validation.bin')
@@ -30,11 +30,10 @@ gradient_accumulation_steps = 4 * 8
 
 learning_rate = 1.5e-4
 min_lr = 1e-5
-max_iters = 300000
-lr_decay_iters = 300000
-warmup_iters = 3000
-
+max_iters = 3000
+lr_decay_iters = 3000
+warmup_iters =30
 # eval stuff
-eval_interval = 1000
+eval_interval = 10
 log_interval = 10
 

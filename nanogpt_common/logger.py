@@ -73,7 +73,7 @@ class Logger:
 
         if master_process:
             self._logger = create_py_logger()
-        if enable_wandb and master_process:
+        if enable_wandb and master_process and not is_debugging():
             self._run = create_wandb_logger(wandb_project, wandb_run_name, config)
         # else leave things to None
 

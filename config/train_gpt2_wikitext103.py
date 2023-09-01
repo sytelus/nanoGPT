@@ -7,7 +7,7 @@ wandb_log = True
 wandb_project = 'nanogpt-wikitext103'
 wandb_run_name=None
 
-out_dir = os.path.join(os.environ.get('DATA_ROOT', 'out'), 'gpt2-124M-wikitext103')
+out_dir = os.path.join(os.environ.get('DATA_ROOT', 'out'), 'gpt2-wt103')
 
 dataset = 'wikitext-103-raw-v1'
 data_dir = os.path.join(os.environ.get('DATA_ROOT', '/data'), 'tokenized', dataset, 'tiktoken')
@@ -23,10 +23,10 @@ n_embd = 1024
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 16
+batch_size = 8
 learning_rate = 6e-4
 block_size = 1024
-gradient_accumulation_steps = 4 * 8
+gradient_accumulation_steps = 8 * 8 # this will be divided by number of GPUs
 
 learning_rate = 1.5e-4
 min_lr = 1e-5

@@ -13,13 +13,23 @@
             "justMyCode": true
         },
         {
-            "name": "Train-1GPU",
+            "name": "Train-WT103-1GPU",
             "type": "python",
             "request": "launch",
             "program": "${cwd}/train.py",
             "args": ["config/train_gpt2_wikitext103.py"],
             "console": "integratedTerminal",
             "justMyCode": true
-        }
+        },
+        {
+            "name": "Train-WT2-1GPU",
+            "type": "python",
+            "request": "launch",
+            "program": "${cwd}/train.py",
+            "args": ["config/train_gpt2_wikitext2.py"],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2"}
+        },
     ]
 }
